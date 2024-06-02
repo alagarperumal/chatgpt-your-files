@@ -1,4 +1,4 @@
-#edited 
+#edited....
 <img alt="pgvector to Prod in 2 hours" src="./assets/hero.png">
 <h1 align="center">Workshop: pgvector to Prod in 2 hours</h1>
 
