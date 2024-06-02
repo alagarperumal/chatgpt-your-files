@@ -147,7 +147,6 @@ Refer to this step if you want to learn about the additions added on top of `cre
       "imports": {
         "@std/": "https://deno.land/std@0.168.0/",
 
-        "@xenova/transformers": "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.6.1",
         "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.21.0",
         "openai": "https://esm.sh/openai@4.10.0",
         "common-tags": "https://esm.sh/common-tags@1.8.2",
@@ -460,6 +459,19 @@ Let's create a `documents` and `document_sections` table to store our processed 
     );
     ```
 
+    _Note: Since the video was published, `on delete cascade` was
+    added as a new migration so that the lifecycle of `document_sections`
+    is tied to their respective document._
+
+    ```sql
+    alter table document_sections
+    drop constraint document_sections_document_id_fkey,
+    add constraint document_sections_document_id_fkey
+      foreign key (document_id)
+      references documents(id)
+      on delete cascade;
+    ```
+
 1.  Add HNSW index.
 
     Unlike IVFFlat indexes, HNSW indexes can be create immediately on an empty table.
@@ -630,7 +642,6 @@ Let's create a `documents` and `document_sections` table to store our processed 
       "imports": {
         "@std/": "https://deno.land/std@0.168.0/",
 
-        "@xenova/transformers": "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.6.1",
         "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.21.0",
         "openai": "https://esm.sh/openai@4.10.0",
         "common-tags": "https://esm.sh/common-tags@1.8.2",
@@ -884,13 +895,13 @@ Now let's add logic to generate embeddings automatically anytime new rows are ad
     declare
       content_column text = TG_ARGV[0];
       embedding_column text = TG_ARGV[1];
-      batch_size int = TG_ARGV[2];
+      batch_size int = case when array_length(TG_ARGV, 1) >= 3 then TG_ARGV[2]::int else 5 end;
+      timeout_milliseconds int = case when array_length(TG_ARGV, 1) >= 4 then TG_ARGV[3]::int else 5 * 60 * 1000 end;
       batch_count int = ceiling((select count(*) from inserted) / batch_size::float);
-      result int;
     begin
-
+      -- Loop through each batch and invoke an edge function to handle the embedding generation
       for i in 0 .. (batch_count-1) loop
-      select
+      perform
         net.http_post(
           url := supabase_url() || '/functions/v1/embed',
           headers := jsonb_build_object(
@@ -902,9 +913,9 @@ Now let's add logic to generate embeddings automatically anytime new rows are ad
             'table', TG_TABLE_NAME,
             'contentColumn', content_column,
             'embeddingColumn', embedding_column
-          )
-        )
-      into result;
+          ),
+          timeout_milliseconds := timeout_milliseconds
+        );
       end loop;
 
       return null;
@@ -919,14 +930,39 @@ Now let's add logic to generate embeddings automatically anytime new rows are ad
       after insert on document_sections
       referencing new table as inserted
       for each statement
-      execute procedure private.embed(content, embedding, 5); -- changed this to 5 to help with reports of CPU limits reached
+      execute procedure private.embed(content, embedding);
     ```
 
-    Note we pass 3 arguments to `embed()`:
+    Note we pass 2 trigger arguments to `embed()`:
 
     - The first specifies which column contains the text content to embed.
     - The second specifies the destination column to save the embedding into.
-    - The third specifies the number of records to include in each edge function call.
+
+    There are also 2 more optional trigger arguments available:
+
+    ```sql
+    create trigger embed_document_sections
+      after insert on document_sections
+      referencing new table as inserted
+      for each statement
+      execute procedure private.embed(content, embedding, 5, 300000);
+    ```
+
+    - The third argument specifies the batch size (number of records to include in each edge function call). Default is 5.
+    - The fourth argument specifies the HTTP connection timeout for each edge function call. Default is 300000 ms (5 minutes).
+
+    Feel free to adjust these according to your needs. A larger batch size will require a longer timeout per request, since each invocation will have more embeddings to generate. A smaller batch size can use a lower timeout.
+
+    <details>
+    <summary><i>Note: Lifecycle of triggered edge functions</i></summary>
+    If the triggered edge function fails, you will end up with
+    document sections missing embeddings. During development,
+    we can run `supabase db reset` to reset the database. In production,
+    some potential options are:
+
+    - Add another function that can be triggered manually which checks for `document_sections` with missing embeddings and invokes the `/embed` edge function for them.
+    - Create a [scheduled function](https://supabase.com/docs/guides/functions/schedule-functions) that periodically checks for `document_sections` with missing embeddings and re-generates them. We would likely need to add a locking mechanism (ie. via another column) to prevent the scheduled function from conflicting with the normal `embed` trigger.
+    </details>
 
 1.  Apply the migration to our local database.
 
@@ -948,21 +984,18 @@ Now let's add logic to generate embeddings automatically anytime new rows are ad
     npx supabase functions new embed
     ```
 
-1.  In `embed/index.ts`, create an embedding pipeline using Transformers.js.
+1.  In `embed/index.ts`, create an inference session using Supabase's AI inference engine.
 
     ```tsx
+    // Setup type definitions for built-in Supabase Runtime APIs
+    /// <reference types="https://esm.sh/@supabase/functions-js/src/edge-runtime.d.ts" />
+
     import { createClient } from '@supabase/supabase-js';
-    import { env, pipeline } from '@xenova/transformers';
 
-    // Configuration for Deno runtime
-    env.useBrowserCache = false;
-    env.allowLocalModels = false;
-
-    const generateEmbedding = await pipeline(
-      'feature-extraction',
-      'Supabase/gte-small'
-    );
+    const model = new Supabase.ai.Session('gte-small');
     ```
+
+    _Note: The original code from the video tutorial used Transformers.js to perform inference in the Edge Function. We've since released [Supabase.ai APIs](https://supabase.com/docs/guides/functions/ai-models) that can perform inference natively within the runtime itself (vs. WASM) which is faster and uses less CPU time._
 
 1.  Just like before, grab the Supabase variables and check for their existence _(type narrowing)_.
 
@@ -1034,7 +1067,7 @@ Now let's add logic to generate embeddings automatically anytime new rows are ad
 
 1.  Generate an embedding for each piece of text and update the respective rows.
 
-    ```tsx
+    ```ts
     for (const row of rows) {
       const { id, [contentColumn]: content } = row;
 
@@ -1043,12 +1076,12 @@ Now let's add logic to generate embeddings automatically anytime new rows are ad
         continue;
       }
 
-      const output = await generateEmbedding(content, {
-        pooling: 'mean',
+      const output = (await model.run(content, {
+        mean_pool: true,
         normalize: true,
-      });
+      })) as number[];
 
-      const embedding = JSON.stringify(Array.from(output.data));
+      const embedding = JSON.stringify(output);
 
       const { error } = await supabase
         .from(table)
@@ -1121,6 +1154,8 @@ Finally, let's implement the chat functionality. For this workshop, we're going 
     npm i @xenova/transformers ai
     ```
 
+    We'll use [Transformers.js](https://github.com/xenova/transformers.js) to perform inference directly in the browser.
+
 1.  Configure `next.config.js` to support Transformers.js
 
     ```jsx
@@ -1142,7 +1177,7 @@ Finally, let's implement the chat functionality. For this workshop, we're going 
     import { useChat } from 'ai/react';
     ```
 
-    _Note: `usePipeline()` was pre-built into this repository for convenience. It uses Web Workers to asynchronously generate embeddings in another thread. We'll be releasing this hook and more into a dedicated NPM package shortly._
+    _Note: `usePipeline()` was pre-built into this repository for convenience. It uses Web Workers to asynchronously generate embeddings in another thread using Transformers.js._
 
 1.  Create a Supabase client in `chat/page.tsx`.
 
@@ -1160,6 +1195,14 @@ Finally, let's implement the chat functionality. For this workshop, we're going 
     ```
 
     _Note: it's important that the embedding model you set here matches the model used in the Edge Function, otherwise your future matching logic will be meaningless._
+
+    _Transformers.js requires models to exist in the ONNX format. Specifically
+    the Hugging Face model you specify in the pipeline must have an `.onnx` file
+    under the `./onnx` folder, otherwise you will see the error
+    `Could not locate file [...] xxx.onnx`. Check out
+    [this explanation](https://www.youtube.com/watch?v=QdDoFfkVkcw&t=3825s) for more details.
+    To convert an existing model (eg. PyTorch, Tensorflow, etc) to ONNX, see
+    the [custom usage documentation](https://huggingface.co/docs/transformers.js/en/custom_usage#convert-your-models-to-onnx)._
 
 1.  Manage chat messages and state with `useChat()`.
 
@@ -1283,6 +1326,16 @@ Finally, let's implement the chat functionality. For this workshop, we're going 
 
 #### Create `chat` Edge Function
 
+**Note:** In this tutorial we use models provided by OpenAI to implement the chat logic.
+However since making this tutorial, many new LLM providers exist, such as:
+
+- [together.ai](https://docs.together.ai/docs/openai-api-compatibility#nodejs)
+- [fireworks.ai](https://readme.fireworks.ai/docs/openai-compatibility)
+- [endpoints.anyscale.com](https://docs.endpoints.anyscale.com/examples/work-with-openai/)
+- [local models served with Ollama](https://github.com/ollama/ollama/blob/main/docs/openai.md#openai-javascript-library)
+
+Whichever provider you choose, you can reuse the code below (that uses the OpenAI lib) as long as they offer an OpenAI-compatible API _(all of providers listed above do)_. We'll discuss how to do this in each step using Ollama, but the same logic applies to the other providers.
+
 1.  First generate an API key from [OpenAI](https://platform.openai.com/account/api-keys) and save it in `supabase/functions/.env`.
 
     ```bash
@@ -1313,6 +1366,26 @@ Finally, let's implement the chat functionality. For this workshop, we're going 
     const supabaseUrl = Deno.env.get('SUPABASE_URL');
     const supabaseAnonKey = Deno.env.get('SUPABASE_ANON_KEY');
     ```
+
+    <details>
+    <summary><i>Note: Ollama support</i></summary>
+
+    For Ollama (and other OpenAI-compatible providers), adjust the `baseURL` and `apiKey` when instantiating `openai`:
+
+    ```tsx
+    const openai = new OpenAI({
+      baseURL: 'http://host.docker.internal:11434/v1/',
+      apiKey: 'ollama',
+    });
+    ```
+
+    We assume here that you're running `ollama serve` locally
+    with the default port `:11434`.
+    Since local edge functions run inside a Docker container,
+    we specify `host.docker.internal` instead of `localhost`
+    in order to reach Ollama running on your host.
+
+    </details>
 
 1.  Since our frontend is served at a different domain origin than our Edge Function, we must handle cross origin resource sharing (CORS).
 
@@ -1455,6 +1528,17 @@ Finally, let's implement the chat functionality. For this workshop, we're going 
     `OpenAIStream` and `StreamingTextResponse` are convenience helpers from Vercel's `ai` package that translate OpenAI's response stream into a format that `useChat()` understands on the frontend.
 
     _Note: we must also return CORS headers here (or anywhere else we send a response)._
+
+    <details>
+    <summary><i>Note: Ollama support</i></summary>
+    Change the model to a model you're serving locally, for example:
+
+    ```diff
+    -     model: 'gpt-3.5-turbo-0613',
+    +     model: 'dolphin-mistral',
+    ```
+
+    </details>
 
 1.  If you're developing directly on the cloud, set your `OPENAI_API_KEY` secret in the cloud:
 
